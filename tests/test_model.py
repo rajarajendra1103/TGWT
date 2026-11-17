@@ -1,0 +1,66 @@
+"""
+Unit tests for full TGWT model and parameter-matched baseline.
+"""
+
+import unittest
+import torch
+from tgwt.model.tgwt_model import TGWTForCausalLM
+from tgwt.model.baseline_llama import BaselineTransformerLM
+
+
+class TestModelPipeline(unittest.TestCase):
+
+    def test_tgwt_forward_backward(self):
+        B, N, V = 2, 32, 1000
+        model = TGWTForCausalLM(
+            vocab_size=V,
+            max_seq_len=64,
+            d_model=64,
+            n_heads=4,
+            n_layers=2,
+            d_prop_node=16,
+            d_prop_edge=16,
+            walk_length=16,
+            branch_factor=4,
+            oversample_ratio=1.5,
+        )
+
+        input_ids = torch.randint(0, V, (B, N), dtype=torch.long)
+        labels = input_ids.clone()
+
+        out = model(input_ids, labels=labels)
+
+        self.assertIn("logits", out)
+        self.assertIn("loss", out)
+        self.assertEqual(out["logits"].shape, (B, N, V))
+        self.assertIsNotNone(out["loss"])
+
+        # Test backward pass
+        out["loss"].backward()
+
+        # Check gradients exist
+        has_grads = any(p.grad is not None and p.grad.norm() > 0 for p in model.parameters())
+        self.assertTrue(has_grads)
+
+    def test_baseline_forward_backward(self):
+        B, N, V = 2, 32, 1000
+        model = BaselineTransformerLM(
+            vocab_size=V,
+            max_seq_len=64,
+            d_model=64,
+            n_heads=4,
+            n_layers=2,
+        )
+
+        input_ids = torch.randint(0, V, (B, N), dtype=torch.long)
+        labels = input_ids.clone()
+
+        out = model(input_ids, labels=labels)
+
+        self.assertEqual(out["logits"].shape, (B, N, V))
+        self.assertIsNotNone(out["loss"])
+        out["loss"].backward()
+
+
+if __name__ == "__main__":
+    unittest.main()

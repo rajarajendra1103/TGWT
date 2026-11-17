@@ -1,0 +1,36 @@
+# TGWT Configuration for Google Colab NVIDIA Tesla T4 GPU (16GB VRAM)
+
+model:
+  type: "tgwt"
+  vocab_size: 50257
+  max_seq_len: 4096
+  d_model: 512
+  n_heads: 8
+  n_layers: 4
+  d_prop_node: 64
+  d_prop_edge: 64
+  walk_length: 32
+  branch_factor: 4
+  oversample_ratio: 1.5
+  dropout: 0.1
+  tie_weights: true
+
+training:
+  batch_size: 4
+  seq_len: 1024
+  learning_rate: 3.0e-4
+  min_lr: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 200
+  max_steps: 5000
+  gradient_accumulation_steps: 2
+  mixed_precision: "fp16" # Colab T4 native fast precision
+  seed: 42
+  eval_interval: 250
+  save_interval: 1000
+  log_interval: 50
+  output_dir: "./checkpoints_tgwt"
+
+data:
+  dataset_name: "wikitext-103"
+  cache_dir: "./data_cache"
