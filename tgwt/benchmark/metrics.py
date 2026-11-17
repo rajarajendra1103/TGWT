@@ -3,7 +3,7 @@ The 5 Benchmark Metrics for TGWT:
 1. Validation Loss / Perplexity (PPL)
 2. Throughput (Tokens / Second)
 3. Peak VRAM / Memory Usage (MB)
-4. Theoretical FLOPs per Token
+4. Theoretical & Dynamic FLOPs per Token (captures O(N^2) vs O(N * W))
 5. Prediction Accuracy (%)
 """
 
@@ -18,7 +18,6 @@ import torch.nn.functional as F
 def compute_perplexity(loss: float) -> float:
     """
     Computes perplexity from cross-entropy loss.
-    Clamps loss to prevent overflow.
     """
     try:
         return math.exp(min(loss, 20.0))
@@ -26,41 +25,71 @@ def compute_perplexity(loss: float) -> float:
         return float("inf")
 
 
+def measure_flops_dynamic(model: nn.Module, input_ids: torch.Tensor) -> Optional[float]:
+    """
+    Measures actual tensor FLOPs using PyTorch FlopCounterMode if available.
+    """
+    try:
+        from torch.utils.flop_counter import FlopCounterMode
+        with torch.no_grad():
+            with FlopCounterMode(display=False) as flop_counter:
+                _ = model(input_ids)
+            total_flops = flop_counter.get_total_flops()
+            tokens = input_ids.numel()
+            if total_flops and total_flops > 0:
+                return float(total_flops / max(1, tokens))
+    except Exception:
+        pass
+    return None
+
+
 def compute_flops_per_token(
     model_type: str,
     seq_len: int,
     d_model: int,
     n_layers: int,
+    d_ff: Optional[int] = None,
     walk_length: int = 32,
     oversample_ratio: float = 1.5,
+    d_prop: int = 128,
 ) -> float:
     """
-    Computes theoretical FLOPs per token per layer.
-    Standard Transformer:
-      - QKV projections: 3 * 2 * D^2 = 6 D^2
-      - Attention matrix & score: 2 * N * D (scales quadratically with N!)
-      - Out projection: 2 * D^2
-      - FFN (2 layers, 4D intermediate): 2 * 2 * 4 * D^2 = 16 D^2
-      Total standard per token = (24 D^2 + 2 N D) * n_layers
+    Accurate analytical FLOP counter per token:
+    Standard / Llama Transformer:
+      - QKV projections: 6 D^2
+      - Output projection: 2 D^2
+      - FFN (SwiGLU/GELU): 4 D * d_ff
+      - Full Attention: 4 * N * D (scales quadratically O(N^2) with context length!)
+      Total per token = (8 D^2 + 4 D * d_ff + 4 * N * D) * n_layers
 
-    TGWT:
-      - Walks process c * N tokens with fixed attention window W
-      Total TGWT per token = (24 * c * D^2 + 2 * c * W * D + fusion_flops) * n_layers
-      Notice: W is constant (e.g. 32), so FLOPs per token does NOT scale with N!
+    TGWT (Tree-Graph Walk Transformer):
+      - Walks process c * N tokens with fixed attention window W=32
+      - QKV projections: c * 6 D^2
+      - Output projection: c * 2 D^2
+      - FFN: c * 4 D * d_ff
+      - Windowed Attention: c * 4 * W * D (STRICTLY CONSTANT with respect to N!)
+      - Property Fusion: 2 * c * D * (D + d_prop)
+      Total per token = c * (8 D^2 + 4 D * d_ff + 4 * W * D) * n_layers + 2 * c * D * (D + d_prop)
     """
     c = oversample_ratio
     W = walk_length
     D = d_model
+    ff = d_ff if d_ff is not None else 4 * D
 
-    if model_type.lower() in ("standard", "baseline", "llama", "transformer"):
-        # Flops per token per layer: 24 D^2 + 2 N D
-        layer_flops = 24 * (D ** 2) + 2 * seq_len * D
+    name = model_type.lower()
+    is_baseline = any(k in name for k in ("standard", "baseline", "llama", "transformer")) and ("tgwt" not in name)
+
+    if is_baseline:
+        # Full attention scales linearly per token with N (quadratic total O(N^2))
+        layer_flops = 8 * (D ** 2) + 4 * D * ff + 4 * seq_len * D
+        total_flops = layer_flops * n_layers
     else:  # TGWT
-        # Attention on M walks: 24 * c * D^2 + 2 * c * W * D
-        # Fusion projection: ~4 * c * D^2
-        layer_flops = 28 * c * (D ** 2) + 2 * c * W * D
+        # Walk attention is bounded by constant W=32 (linear total O(N))
+        layer_flops = c * (8 * (D ** 2) + 4 * D * ff + 4 * W * D)
+        fusion_flops = 2 * c * D * (D + d_prop)
+        total_flops = layer_flops * n_layers + fusion_flops
 
-    return float(layer_flops * n_layers)
+    return float(total_flops)
 
 
 def measure_throughput_and_vram(
@@ -74,7 +103,7 @@ def measure_throughput_and_vram(
     """
     Measures:
     1. Throughput in tokens/sec
-    2. Peak allocated VRAM in MB (or 0.0 if running on CPU)
+    2. Peak allocated VRAM in MB
     """
     device = input_ids.device
     is_cuda = device.type == "cuda"
@@ -86,7 +115,7 @@ def measure_throughput_and_vram(
     model.eval() if not backward else model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4) if backward else None
 
-    # Use FP16 autocast on CUDA to match training speed and prevent OOM
+    # Use FP16 autocast on CUDA to match production speed
     if is_cuda and hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
         autocast_ctx = torch.amp.autocast("cuda", dtype=torch.float16)
     else:
@@ -142,7 +171,6 @@ def compute_prediction_accuracy(
     """
     Computes top-1 next-token prediction accuracy.
     """
-    # Shift logits and targets
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
 
@@ -163,6 +191,7 @@ def benchmark_model(
     labels: torch.Tensor,
     n_layers: int,
     d_model: int,
+    d_ff: Optional[int] = None,
     walk_length: int = 32,
 ) -> Dict[str, Union[float, str]]:
     """
@@ -194,14 +223,19 @@ def benchmark_model(
         backward=False,
     )
 
-    # Compute theoretical FLOPs per token
-    flops = compute_flops_per_token(
-        model_type=model_name,
-        seq_len=N,
-        d_model=d_model,
-        n_layers=n_layers,
-        walk_length=walk_length,
-    )
+    # Dynamic measurement or accurate analytical calculation
+    dyn_flops = measure_flops_dynamic(model, input_ids)
+    if dyn_flops is not None:
+        flops = dyn_flops
+    else:
+        flops = compute_flops_per_token(
+            model_type=model_name,
+            seq_len=N,
+            d_model=d_model,
+            n_layers=n_layers,
+            d_ff=d_ff,
+            walk_length=walk_length,
+        )
 
     return {
         "model": model_name,

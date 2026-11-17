@@ -10,6 +10,7 @@ from .metrics import (
     benchmark_model,
 )
 from .compare import create_matched_models, format_comparison_table
+from .niah import evaluate_niah_retrieval
 
 __all__ = [
     "compute_perplexity",
@@ -19,4 +20,5 @@ __all__ = [
     "benchmark_model",
     "create_matched_models",
     "format_comparison_table",
+    "evaluate_niah_retrieval",
 ]

@@ -15,7 +15,7 @@ class ScatterPoolingLayer(nn.Module):
     """
     Vectorized Scatter Pooling Layer.
     Merges updated walk vectors [B, M, W, D] back into graph nodes [B, K, D]
-    via scatter-mean followed by gated updates.
+    via native PyTorch C++ scatter_reduce followed by gated updates.
     """
 
     def __init__(self, d_model: int):
@@ -39,25 +39,20 @@ class ScatterPoolingLayer(nn.Module):
         device = walk_outputs.device
         dtype = walk_outputs.dtype
 
-        # Flatten walks: [B, M * W] and [B, M * W, D]
         flat_indices = walk_node_indices.view(B, M * W)
         flat_outputs = walk_outputs.view(B, M * W, D)
 
-        # 1. Accumulate sum of representations for each node
+        # 1. Native PyTorch C++ scatter_reduce (O(1) memory allocation)
         expanded_indices = flat_indices.unsqueeze(-1).expand(-1, -1, D)
-        sum_pooled = torch.zeros(B, K, D, device=device, dtype=dtype)
-        sum_pooled.scatter_add_(1, expanded_indices, flat_outputs)
+        mean_pooled = torch.zeros(B, K, D, device=device, dtype=dtype)
+        mean_pooled = mean_pooled.scatter_reduce(
+            1, expanded_indices, flat_outputs, reduce="mean", include_self=False
+        )
 
-        # 2. Accumulate visitation counts for scatter-mean
-        counts = torch.zeros(B, K, 1, device=device, dtype=dtype)
-        ones = torch.ones(B, M * W, 1, device=device, dtype=dtype)
-        counts.scatter_add_(1, flat_indices.unsqueeze(-1), ones)
-
-        # Active mask: nodes visited by at least one walk
-        active_mask = counts.squeeze(-1) > 0  # [B, K]
-
-        # Compute scatter-mean (clamp counts to 1 to avoid division by zero)
-        mean_pooled = sum_pooled / counts.clamp(min=1.0)
+        # 2. Fast active mask computation
+        visited_counts = torch.zeros(B, K, device=device, dtype=torch.float32)
+        visited_counts.scatter_add_(1, flat_indices, torch.ones_like(flat_indices, dtype=torch.float32))
+        active_mask = visited_counts > 0
 
         # 3. Gated blending update
         updated_features = self.gated_updater(

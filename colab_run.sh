@@ -9,11 +9,15 @@ set -e
 echo "=== 1. Checking GPU Environment ==="
 nvidia-smi
 
-echo "=== 2. Cloning TGWT Repository ==="
+echo "=== 2. Cloning / Updating TGWT Repository ==="
 if [ ! -d "TGWT" ]; then
     git clone https://github.com/rajarajendra1103/TGWT.git
+    cd TGWT
+else
+    cd TGWT
+    git fetch origin
+    git reset --hard origin/main
 fi
-cd TGWT
 
 echo "=== 3. Installing Dependencies ==="
 pip install -r requirements.txt

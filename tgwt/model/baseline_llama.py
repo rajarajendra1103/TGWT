@@ -50,7 +50,7 @@ class BaselineTransformerLM(nn.Module):
     def __init__(
         self,
         vocab_size: int = 50257,
-        max_seq_len: int = 4096,
+        max_seq_len: int = 16384,
         d_model: int = 512,
         n_heads: int = 8,
         n_layers: int = 4,
@@ -63,6 +63,7 @@ class BaselineTransformerLM(nn.Module):
         self.max_seq_len = max_seq_len
         self.d_model = d_model
         self.n_layers = n_layers
+        self.d_ff = d_ff if d_ff is not None else 4 * d_model
 
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
@@ -72,7 +73,7 @@ class BaselineTransformerLM(nn.Module):
             BaselineTransformerBlock(
                 d_model=d_model,
                 n_heads=n_heads,
-                d_ff=d_ff,
+                d_ff=self.d_ff,
                 dropout=dropout,
             )
             for _ in range(n_layers)

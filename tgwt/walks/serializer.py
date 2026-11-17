@@ -2,7 +2,7 @@
 GPU-Vectorized Walk Serializer for TGWT.
 Converts the 2D/hierarchical Tree-Graph into a fixed-length 1D walk batch
 of shape [B, M, W] with linear complexity O(N).
-Fully vectorized with pure PyTorch tensor operations on CUDA (Zero Python loops over walkers).
+Fully vectorized with pure PyTorch tensor operations on CUDA and cached static adjacency.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -17,6 +17,7 @@ class WalkSerializer(nn.Module):
     """
     High-Performance GPU-Vectorized Walk Serializer.
     Executes walk routing in parallel across all batch elements and walks simultaneously.
+    Caches graph adjacency per (K, device) to eliminate dynamic allocation overhead.
     """
 
     def __init__(
@@ -36,20 +37,20 @@ class WalkSerializer(nn.Module):
         self.gamma = gamma_forward
         self.max_degree = max_degree
 
-    def _build_gpu_adjacency(
+        # Cache for static GPU adjacency tables
+        self._adj_cache: Dict[Tuple[int, str], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+    def _get_gpu_adjacency(
         self,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
         total_nodes: int,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Builds fixed-width neighbor tensors on GPU for parallel gather operations:
-        - adj_nbrs: [K, max_deg]
-        - adj_etypes: [K, max_deg]
-        - adj_eindices: [K, max_deg]
-        - adj_mask: [K, max_deg] (bool)
-        """
+        cache_key = (total_nodes, str(device))
+        if cache_key in self._adj_cache:
+            return self._adj_cache[cache_key]
+
         K = total_nodes
         max_deg = self.max_degree
 
@@ -59,11 +60,6 @@ class WalkSerializer(nn.Module):
         E = edge_index.shape[1]
         eindices = torch.arange(E, device=device)
 
-        # Count degree per source node
-        degrees = torch.zeros(K, dtype=torch.long, device=device)
-        degrees.scatter_add_(0, src, torch.ones_like(src))
-
-        # Assign a local neighbor slot [0..deg-1] for each edge
         sorted_src, perm = torch.sort(src)
         sorted_dst = dst[perm]
         sorted_etypes = etypes[perm]
@@ -79,7 +75,6 @@ class WalkSerializer(nn.Module):
         )
         local_slot = torch.arange(E, device=device) - run_starts
 
-        # Keep only edges that fit in max_deg
         valid_edge_mask = local_slot < max_deg
         filt_src = sorted_src[valid_edge_mask]
         filt_slot = local_slot[valid_edge_mask]
@@ -87,7 +82,6 @@ class WalkSerializer(nn.Module):
         filt_etypes = sorted_etypes[valid_edge_mask]
         filt_eindices = sorted_eindices[valid_edge_mask]
 
-        # Allocate fixed table
         adj_nbrs = torch.zeros((K, max_deg), dtype=torch.long, device=device)
         adj_etypes = torch.zeros((K, max_deg), dtype=torch.long, device=device)
         adj_eindices = torch.zeros((K, max_deg), dtype=torch.long, device=device)
@@ -99,72 +93,61 @@ class WalkSerializer(nn.Module):
         adj_eindices.view(-1).scatter_(0, flat_dest_idx, filt_eindices)
         adj_mask.view(-1).scatter_(0, flat_dest_idx, True)
 
-        return adj_nbrs, adj_etypes, adj_eindices, adj_mask
+        self._adj_cache[cache_key] = (adj_nbrs, adj_etypes, adj_eindices, adj_mask)
+        return self._adj_cache[cache_key]
 
     def forward(
         self,
         tree_graph: TreeGraphData,
         properties: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Vectorized walk generation on GPU.
-
-        Returns:
-            walk_nodes: [B, M, W] node indices along walks
-            walk_edge_attrs: [B, M, W, 3] edge attributes of each transition
-        """
         B, K, _ = tree_graph.node_features.shape
         N = tree_graph.num_leaves
         W = self.walk_length
         device = tree_graph.device
 
-        # Number of walks M scaled linearly with N
+        # Linear scaling M
         M = max(1, math.ceil((N * self.oversample_ratio) / W))
+        D_deg = self.max_degree
 
-        # Build GPU neighbor table
-        adj_nbrs, adj_etypes, adj_eindices, adj_mask = self._build_gpu_adjacency(
+        adj_nbrs, adj_etypes, adj_eindices, adj_mask = self._get_gpu_adjacency(
             tree_graph.edge_index,
             tree_graph.edge_attr,
             K,
             device,
         )
-        D_deg = self.max_degree
 
         # Seed nodes evenly spaced across leaves
         step_stride = max(1, N // M)
-        seed_indices = torch.arange(M, device=device) * step_stride % N # [M]
-        curr_nodes = seed_indices.unsqueeze(0).expand(B, -1).clone()     # [B, M]
-        prev_nodes = torch.full_like(curr_nodes, -1)                     # [B, M]
+        seed_indices = torch.arange(M, device=device) * step_stride % N
+        curr_nodes = seed_indices.unsqueeze(0).expand(B, -1).clone()
+        prev_nodes = torch.full_like(curr_nodes, -1)
 
-        # Preallocate result tensors
         walk_nodes = torch.zeros((B, M, W), dtype=torch.long, device=device)
         walk_eindices = torch.zeros((B, M, W), dtype=torch.long, device=device)
-
         walk_nodes[:, :, 0] = curr_nodes
 
-        # Dynamic visits state clone
-        b_visits = properties["visit_count"].clone()       # [B, K]
-        b_surprise = properties["surprise_score"]          # [B, K]
+        b_visits = properties["visit_count"].clone()
+        b_surprise = properties["surprise_score"]
 
-        # Initial seed visit bump
-        b_visits.scatter_add_(1, curr_nodes, torch.full_like(curr_nodes, 0.5, dtype=torch.float32))
+        # Pre-allocate deltas
+        seed_delta = torch.full_like(curr_nodes, 0.5, dtype=torch.float32)
+        step_delta = torch.full_like(curr_nodes, 0.2, dtype=torch.float32)
+        b_visits.scatter_add_(1, curr_nodes, seed_delta)
 
-        # Vectorized step loop along W (Only 31 GPU iterations!)
+        flat_shape = (B, M * D_deg)
+
         for step in range(1, W):
-            # 1. Lookup candidates for all B x M walkers in one operation
             cand_nbrs = adj_nbrs[curr_nodes]         # [B, M, D_deg]
             cand_etypes = adj_etypes[curr_nodes]     # [B, M, D_deg]
             cand_eindices = adj_eindices[curr_nodes] # [B, M, D_deg]
             cand_mask = adj_mask[curr_nodes]         # [B, M, D_deg]
 
-            # 2. Gather visits and surprise scores for all candidates
-            exp_visits = b_visits.unsqueeze(1).expand(-1, M, -1)
-            exp_surprise = b_surprise.unsqueeze(1).expand(-1, M, -1)
+            # Fast 2D gather without allocating 3D [B, M, K] tensors
+            flat_cand_nbrs = cand_nbrs.view(flat_shape)
+            nbr_visits = torch.gather(b_visits, 1, flat_cand_nbrs).view(B, M, D_deg)
+            nbr_surprise = torch.gather(b_surprise, 1, flat_cand_nbrs).view(B, M, D_deg)
 
-            nbr_visits = torch.gather(exp_visits, 2, cand_nbrs)     # [B, M, D_deg]
-            nbr_surprise = torch.gather(exp_surprise, 2, cand_nbrs) # [B, M, D_deg]
-
-            # 3. Vectorized deterministic scoring
             forward_bonus = torch.where(
                 (cand_etypes == 1) | (cand_etypes == 5),
                 self.gamma,
@@ -184,22 +167,16 @@ class WalkSerializer(nn.Module):
             )
             scores = scores.masked_fill(~cand_mask, -1e9)
 
-            # 4. Argmax over candidates for all B x M walkers in parallel
-            best_choice = scores.argmax(dim=-1, keepdim=True) # [B, M, 1]
-            nxt_nodes = torch.gather(cand_nbrs, 2, best_choice).squeeze(-1)       # [B, M]
-            nxt_eindices = torch.gather(cand_eindices, 2, best_choice).squeeze(-1) # [B, M]
+            best_choice = scores.argmax(dim=-1, keepdim=True)
+            nxt_nodes = torch.gather(cand_nbrs, 2, best_choice).squeeze(-1)
+            nxt_eindices = torch.gather(cand_eindices, 2, best_choice).squeeze(-1)
 
-            # 5. Update state
             prev_nodes = curr_nodes
             curr_nodes = nxt_nodes
 
             walk_nodes[:, :, step] = curr_nodes
             walk_eindices[:, :, step] = nxt_eindices
+            b_visits.scatter_add_(1, curr_nodes, step_delta)
 
-            # Update visits
-            b_visits.scatter_add_(1, curr_nodes, torch.full_like(curr_nodes, 0.2, dtype=torch.float32))
-
-        # Vectorized gather of all edge attributes in one GPU indexing operation
-        walk_edge_attrs = tree_graph.edge_attr[walk_eindices] # [B, M, W, 3]
-
+        walk_edge_attrs = tree_graph.edge_attr[walk_eindices]
         return walk_nodes, walk_edge_attrs

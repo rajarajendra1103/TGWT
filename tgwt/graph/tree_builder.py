@@ -141,3 +141,37 @@ class TreeBuilder(nn.Module):
         }
 
         return all_node_features, tree_meta
+
+    def pool_features(
+        self, leaf_embeddings: torch.Tensor, tree_meta: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Fast feature pooling path using pre-computed tree topology.
+        """
+        B, N, D = leaf_embeddings.shape
+        levels_features = [leaf_embeddings]
+        curr_features = leaf_embeddings
+        curr_len = N
+
+        while curr_len > 1:
+            next_len = math.ceil(curr_len / self.branch_factor)
+            pad_needed = (next_len * self.branch_factor) - curr_len
+
+            if pad_needed > 0:
+                padded = F.pad(curr_features, (0, 0, 0, pad_needed), mode="constant", value=0.0)
+            else:
+                padded = curr_features
+
+            grouped = padded.view(B, next_len, self.branch_factor, D)
+
+            if self.aggregation == "linear":
+                flat_grouped = grouped.view(B, next_len, self.branch_factor * D)
+                next_features = self.layer_norm(self.pool_proj(flat_grouped))
+            else:
+                next_features = self.layer_norm(grouped.mean(dim=2))
+
+            levels_features.append(next_features)
+            curr_features = next_features
+            curr_len = next_len
+
+        return torch.cat(levels_features, dim=1)

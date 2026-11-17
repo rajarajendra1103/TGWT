@@ -1,8 +1,7 @@
 """
 Property Fusion Projection Layer for TGWT.
 Solves New Problem 3 (Input Vector Crowding) and New Problem 4 (Positional Signal Confusion).
-Passes concatenated content and property vectors through a dedicated linear projection
-and LayerNorm so features align cleanly without overwriting each other.
+Fuses content vectors and metadata properties into size D_model.
 """
 
 import torch
@@ -26,13 +25,8 @@ class PropertyFusionLayer(nn.Module):
         self.d_model = d_model
         total_dim = d_model + d_prop_node + d_prop_edge
 
-        # Two-layer MLP projection for smooth feature alignment
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(total_dim, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model),
-        )
+        # Direct linear projection + LayerNorm for maximum GPU throughput
+        self.proj = nn.Linear(total_dim, d_model, bias=False)
         self.layer_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
@@ -45,12 +39,9 @@ class PropertyFusionLayer(nn.Module):
         """
         Fuses representations and projects to [B, M, W, D_model].
         """
-        # Concatenate along feature dimension
         concatenated = torch.cat(
             [content_vectors, node_prop_vectors, edge_prop_vectors], dim=-1
-        ) # [B, M, W, D_model + d_node + d_edge]
-
-        projected = self.fusion_mlp(concatenated)
-        # Residual fusion with original content vector + LayerNorm
+        )
+        projected = self.proj(concatenated)
         fused = self.layer_norm(content_vectors + self.dropout(projected))
         return fused

@@ -1,5 +1,6 @@
 """
 TreeGraph data structure and builder module for TGWT.
+Includes static topology caching per (N, device) to eliminate graph construction overhead.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -45,6 +46,7 @@ class TreeGraphData:
 class TreeGraphConstructor(nn.Module):
     """
     Complete module to construct a property-rich Tree-Graph from leaf token embeddings.
+    Caches graph structure and edge tables per (N, device).
     """
 
     def __init__(
@@ -63,17 +65,21 @@ class TreeGraphConstructor(nn.Module):
         self.edge_builder = EdgeBuilder(
             semantic_skip_strides=semantic_skip_strides,
         )
+        self._topology_cache: Dict[Tuple[int, str], Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]] = {}
 
     def forward(self, leaf_embeddings: torch.Tensor) -> TreeGraphData:
-        """
-        Args:
-            leaf_embeddings: [B, N, D]
+        B, N, D = leaf_embeddings.shape
+        device = leaf_embeddings.device
+        cache_key = (N, str(device))
 
-        Returns:
-            TreeGraphData container with node features, edges, and metadata.
-        """
-        all_node_features, tree_meta = self.tree_builder(leaf_embeddings)
-        edge_index, edge_attr = self.edge_builder(tree_meta)
+        # Check topology cache
+        if cache_key in self._topology_cache:
+            tree_meta, edge_index, edge_attr = self._topology_cache[cache_key]
+            all_node_features = self.tree_builder.pool_features(leaf_embeddings, tree_meta)
+        else:
+            all_node_features, tree_meta = self.tree_builder(leaf_embeddings)
+            edge_index, edge_attr = self.edge_builder(tree_meta)
+            self._topology_cache[cache_key] = (tree_meta, edge_index, edge_attr)
 
         return TreeGraphData(
             node_features=all_node_features,

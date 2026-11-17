@@ -1,7 +1,7 @@
 """
 Untouched Standard Transformer Block for TGWT.
 Processes fixed-length serialized walks [B * M, W, D] with 100% standard attention.
-Uses PyTorch F.scaled_dot_product_attention for native FlashAttention speed on GPU.
+Uses fused QKV projections and native PyTorch SDPA for maximum FlashAttention / cuDNN performance on GPU.
 """
 
 from typing import Optional
@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 class StandardAttention(nn.Module):
     """
-    Standard multi-head attention module using native PyTorch SDPA.
+    Fused QKV multi-head attention module using native PyTorch SDPA.
     Zero custom CUDA code, fully hardware-accelerated.
     """
 
@@ -28,10 +28,9 @@ class StandardAttention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
 
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        # Fused QKV projection runs in a single fast GEMM kernel
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.dropout = dropout
 
     def forward(
@@ -42,11 +41,12 @@ class StandardAttention(nn.Module):
     ) -> torch.Tensor:
         B, S, D = x.shape
 
-        q = self.q_proj(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        qkv = self.qkv_proj(x).view(B, S, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2) # [B, n_heads, S, head_dim]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-        # PyTorch SDPA automatically chooses FlashAttention, Memory-Efficient Attention, or Math
         attn_out = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
@@ -60,7 +60,7 @@ class StandardAttention(nn.Module):
 
 class StandardFeedForward(nn.Module):
     """
-    Standard Transformer Feed-Forward Network (GELU or SwiGLU).
+    Standard Transformer Feed-Forward Network with GELU activation.
     """
 
     def __init__(
@@ -73,10 +73,10 @@ class StandardFeedForward(nn.Module):
         if d_ff is None:
             d_ff = 4 * d_model
 
-        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear1 = nn.Linear(d_model, d_ff, bias=False)
         self.act = nn.GELU()
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(d_ff, d_model)
+        self.linear2 = nn.Linear(d_ff, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear2(self.dropout(self.act(self.linear1(x))))
@@ -113,11 +113,9 @@ class UntouchedTransformerBlock(nn.Module):
         Input: [B * M, W, D]
         Output: [B * M, W, D]
         """
-        # Self-attention with residual
         normed = self.norm1(x)
         x = x + self.dropout1(self.attn(normed, is_causal=is_causal))
 
-        # FFN with residual
         normed2 = self.norm2(x)
         x = x + self.dropout2(self.ffn(normed2))
         return x
