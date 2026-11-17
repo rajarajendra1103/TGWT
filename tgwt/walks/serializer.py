@@ -129,6 +129,10 @@ class WalkSerializer(nn.Module):
 
         b_visits = properties["visit_count"].clone()
         b_surprise = properties["surprise_score"]
+        causal_positions = tree_graph.tree_meta.get(
+            "causal_positions",
+            torch.arange(K, device=device)
+        )
 
         # Pre-allocate deltas
         seed_delta = torch.full_like(curr_nodes, 0.5, dtype=torch.float32)
@@ -149,7 +153,7 @@ class WalkSerializer(nn.Module):
             nbr_surprise = torch.gather(b_surprise, 1, flat_cand_nbrs).view(B, M, D_deg)
 
             forward_bonus = torch.where(
-                (cand_etypes == 1) | (cand_etypes == 5),
+                (cand_etypes == 2) | (cand_etypes == 5),
                 self.gamma,
                 0.0
             )
@@ -165,7 +169,12 @@ class WalkSerializer(nn.Module):
                 + forward_bonus
                 - backtrack_penalty
             )
-            scores = scores.masked_fill(~cand_mask, -1e9)
+            
+            # Enforce strict causal masking: neighbors with causal position > current node are masked out
+            cand_cpos = causal_positions[cand_nbrs]
+            curr_cpos = causal_positions[curr_nodes].unsqueeze(-1)
+            causal_valid_mask = cand_mask & (cand_cpos <= curr_cpos)
+            scores = scores.masked_fill(~causal_valid_mask, -1e9)
 
             best_choice = scores.argmax(dim=-1, keepdim=True)
             nxt_nodes = torch.gather(cand_nbrs, 2, best_choice).squeeze(-1)

@@ -108,16 +108,25 @@ class BaselineTransformerLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,               # [B, N]
-        labels: Optional[torch.Tensor] = None, # [B, N]
+        input_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        B, N = input_ids.shape
-        device = input_ids.device
-
-        positions = torch.arange(0, N, dtype=torch.long, device=device).unsqueeze(0)
-        tok_emb = self.token_embedding(input_ids)
-        pos_emb = self.pos_embedding(positions)
-        h = self.emb_dropout(tok_emb + pos_emb)
+        if inputs_embeds is not None:
+            B, N, D = inputs_embeds.shape
+            device = inputs_embeds.device
+            positions = torch.arange(0, N, dtype=torch.long, device=device).unsqueeze(0)
+            pos_emb = self.pos_embedding(positions)
+            h = self.emb_dropout(inputs_embeds + pos_emb)
+        else:
+            if input_ids is None:
+                raise ValueError("Must provide either input_ids or inputs_embeds")
+            B, N = input_ids.shape
+            device = input_ids.device
+            positions = torch.arange(0, N, dtype=torch.long, device=device).unsqueeze(0)
+            tok_emb = self.token_embedding(input_ids)
+            pos_emb = self.pos_embedding(positions)
+            h = self.emb_dropout(tok_emb + pos_emb)
 
         for block in self.blocks:
             h = block(h)

@@ -108,13 +108,14 @@ class UntouchedTransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         is_causal: bool = False,
+        attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Input: [B * M, W, D]
         Output: [B * M, W, D]
         """
         normed = self.norm1(x)
-        x = x + self.dropout1(self.attn(normed, is_causal=is_causal))
+        x = x + self.dropout1(self.attn(normed, attn_mask=attn_mask, is_causal=is_causal))
 
         normed2 = self.norm2(x)
         x = x + self.dropout2(self.ffn(normed2))

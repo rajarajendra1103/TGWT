@@ -60,6 +60,9 @@ class TreeBuilder(nn.Module):
         orig_pos_list: List[torch.Tensor] = [
             torch.arange(N, dtype=torch.float32, device=device)
         ]
+        causal_pos_list: List[torch.Tensor] = [
+            torch.arange(N, dtype=torch.long, device=device)
+        ]
 
         # Track parent connections
         # For each level, we will compute which node in the next level it connects to
@@ -96,15 +99,22 @@ class TreeBuilder(nn.Module):
                 torch.full((next_len,), curr_level, dtype=torch.long, device=device)
             )
 
-            # Center position of pooled group
+            # Center position and causal position of pooled group
             prev_positions = orig_pos_list[-1]
+            prev_causal = causal_pos_list[-1]
             if pad_needed > 0:
                 padded_pos = F.pad(prev_positions.unsqueeze(0), (0, pad_needed), mode="replicate").squeeze(0)
+                padded_causal = F.pad(prev_causal.unsqueeze(0), (0, pad_needed), mode="replicate").squeeze(0)
             else:
                 padded_pos = prev_positions
+                padded_causal = prev_causal
             grouped_pos = padded_pos.view(next_len, self.branch_factor)
+            grouped_causal = padded_causal.view(next_len, self.branch_factor)
             next_positions = grouped_pos.mean(dim=1)
+            # Strict causal position: maximum leaf position in this group's span
+            next_causal = grouped_causal.max(dim=1).values
             orig_pos_list.append(next_positions)
+            causal_pos_list.append(next_causal)
 
             # Mapping from current level nodes to next level nodes
             # Each node i in current level maps to running_node_offset + (i // branch_factor)
@@ -125,6 +135,7 @@ class TreeBuilder(nn.Module):
         all_level_ids = torch.cat(level_ids_list, dim=0)
         all_parent_ptrs = torch.cat(parent_ptrs, dim=0)
         all_orig_pos = torch.cat(orig_pos_list, dim=0)
+        all_causal_pos = torch.cat(causal_pos_list, dim=0)
 
         K = all_node_features.shape[1]
         is_leaf = torch.zeros(K, dtype=torch.bool, device=device)
@@ -134,6 +145,7 @@ class TreeBuilder(nn.Module):
             "level_ids": all_level_ids,
             "parent_indices": all_parent_ptrs,
             "original_positions": all_orig_pos,
+            "causal_positions": all_causal_pos,
             "is_leaf": is_leaf,
             "total_nodes": torch.tensor(K, device=device),
             "num_leaves": torch.tensor(N, device=device),

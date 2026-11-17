@@ -146,19 +146,28 @@ class TGWTForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,               # [B, N]
-        labels: Optional[torch.Tensor] = None, # [B, N]
+        input_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        B, N = input_ids.shape
-        device = input_ids.device
+        if inputs_embeds is not None:
+            B, N, D = inputs_embeds.shape
+            device = inputs_embeds.device
+            positions = torch.arange(0, N, dtype=torch.long, device=device).unsqueeze(0)
+            pos_emb = self.pos_embedding(positions)
+            leaf_features = self.emb_dropout(inputs_embeds + pos_emb)
+        else:
+            if input_ids is None:
+                raise ValueError("Must provide either input_ids or inputs_embeds")
+            B, N = input_ids.shape
+            device = input_ids.device
+            positions = torch.arange(0, N, dtype=torch.long, device=device).unsqueeze(0)
+            tok_emb = self.token_embedding(input_ids)
+            pos_emb = self.pos_embedding(positions)
+            leaf_features = self.emb_dropout(tok_emb + pos_emb) # [B, N, D]
+
         D = self.d_model
         W = self.walk_length
-
-        # Stage 1: Base Token Embedding + Positional Encoding
-        positions = torch.arange(0, N, dtype=torch.long, device=device).unsqueeze(0)
-        tok_emb = self.token_embedding(input_ids)
-        pos_emb = self.pos_embedding(positions)
-        leaf_features = self.emb_dropout(tok_emb + pos_emb) # [B, N, D]
 
         # Stage 2: Property-Rich Tree-Graph Construction
         tree_graph = self.graph_constructor(leaf_features)
@@ -199,10 +208,21 @@ class TGWTForCausalLM(nn.Module):
             edge_prop_vectors=walk_edge_props,
         ) # [B, M, W, D]
 
-        # Stage 5: Pass through stack of untouched Transformer blocks
+        # Enforce strict causal attention inside walks:
+        # A walk step query at position p_q may ONLY attend to key steps at position p_k <= p_q
+        causal_positions = tree_graph.tree_meta.get(
+            "causal_positions",
+            torch.arange(K, device=device)
+        )
+        walk_cpos = causal_positions[walk_nodes] # [B, M, W]
+        q_pos = walk_cpos.view(B * M, W, 1)
+        k_pos = walk_cpos.view(B * M, 1, W)
+        causal_walk_mask = (k_pos <= q_pos).unsqueeze(1) # [B * M, 1, W, W] (bool)
+
+        # Stage 5: Pass through stack of untouched Transformer blocks with causal walk mask
         flat_walk_input = fused_walks.view(B * M, W, D)
         for layer in self.transformer_layers:
-            flat_walk_input = layer(flat_walk_input, is_causal=False)
+            flat_walk_input = layer(flat_walk_input, attn_mask=causal_walk_mask)
 
         walk_output = flat_walk_input.view(B, M, W, D)
 

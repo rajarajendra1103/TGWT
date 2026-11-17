@@ -53,12 +53,13 @@ class EdgeBuilder(nn.Module):
         parent_indices = tree_meta["parent_indices"]
         positions = tree_meta["original_positions"]
         level_ids = tree_meta["level_ids"]
+        causal_positions = tree_meta.get("causal_positions", positions.long())
 
         src_list = []
         dst_list = []
         type_list = []
 
-        # 1. Self loops for all nodes
+        # 1. Self loops for all nodes (always causal: u -> u)
         all_nodes = torch.arange(K, device=device)
         src_list.append(all_nodes)
         dst_list.append(all_nodes)
@@ -66,79 +67,64 @@ class EdgeBuilder(nn.Module):
             torch.full((K,), EDGE_TYPE_SELF, dtype=torch.long, device=device)
         )
 
-        # 2. Horizontal sequential edges between adjacent leaf tokens
+        # 2. Horizontal sequential edges: strictly backward (i -> i - 1)
         if N > 1:
-            leaf_src = torch.arange(N - 1, device=device)
-            leaf_dst = torch.arange(1, N, device=device)
+            leaf_curr = torch.arange(1, N, device=device)
+            leaf_prev = torch.arange(0, N - 1, device=device)
 
-            # Next: i -> i + 1
-            src_list.append(leaf_src)
-            dst_list.append(leaf_dst)
-            type_list.append(
-                torch.full((N - 1,), EDGE_TYPE_SEQ_NEXT, dtype=torch.long, device=device)
-            )
-
-            # Prev: i + 1 -> i
-            src_list.append(leaf_dst)
-            dst_list.append(leaf_src)
+            # Prev: i -> i - 1
+            src_list.append(leaf_curr)
+            dst_list.append(leaf_prev)
             type_list.append(
                 torch.full((N - 1,), EDGE_TYPE_SEQ_PREV, dtype=torch.long, device=device)
             )
 
-        # 3. Vertical Tree Edges (Child -> Parent and Parent -> Child)
+        # 3. Vertical Tree Edges (Only when causal: causal_pos[dst] <= causal_pos[src])
         has_parent_mask = parent_indices >= 0
         child_nodes = torch.arange(K, device=device)[has_parent_mask]
         parent_nodes = parent_indices[has_parent_mask]
 
         if len(child_nodes) > 0:
-            # Tree Up: child -> parent
-            src_list.append(child_nodes)
-            dst_list.append(parent_nodes)
-            type_list.append(
-                torch.full(
-                    (len(child_nodes),),
-                    EDGE_TYPE_TREE_UP,
-                    dtype=torch.long,
-                    device=device,
-                )
-            )
-
-            # Tree Down: parent -> child
-            src_list.append(parent_nodes)
-            dst_list.append(child_nodes)
-            type_list.append(
-                torch.full(
-                    (len(child_nodes),),
-                    EDGE_TYPE_TREE_DOWN,
-                    dtype=torch.long,
-                    device=device,
-                )
-            )
-
-        # 4. Semantic / Dilated Skip Bridges across leaf branches
-        for stride in self.semantic_skip_strides:
-            if N > stride:
-                skip_src = torch.arange(N - stride, device=device)
-                skip_dst = torch.arange(stride, N, device=device)
-
-                # Forward skip
-                src_list.append(skip_src)
-                dst_list.append(skip_dst)
+            # Tree Up: child -> parent (allowed only if parent causal_pos <= child causal_pos)
+            valid_up = causal_positions[parent_nodes] <= causal_positions[child_nodes]
+            if valid_up.any():
+                src_list.append(child_nodes[valid_up])
+                dst_list.append(parent_nodes[valid_up])
                 type_list.append(
                     torch.full(
-                        (len(skip_src),),
-                        EDGE_TYPE_SEMANTIC_BRIDGE,
+                        (int(valid_up.sum().item()),),
+                        EDGE_TYPE_TREE_UP,
                         dtype=torch.long,
                         device=device,
                     )
                 )
 
-                # Backward skip
-                src_list.append(skip_dst)
-                dst_list.append(skip_src)
+            # Tree Down: parent -> child (allowed only if child causal_pos <= parent causal_pos)
+            valid_down = causal_positions[child_nodes] <= causal_positions[parent_nodes]
+            if valid_down.any():
+                src_list.append(parent_nodes[valid_down])
+                dst_list.append(child_nodes[valid_down])
                 type_list.append(
                     torch.full(
-                        (len(skip_src),),
+                        (int(valid_down.sum().item()),),
+                        EDGE_TYPE_TREE_DOWN,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                )
+
+        # 4. Semantic Skip Bridges: strictly backward (i -> i - stride)
+        for stride in self.semantic_skip_strides:
+            if N > stride:
+                skip_curr = torch.arange(stride, N, device=device)
+                skip_past = torch.arange(0, N - stride, device=device)
+
+                # Backward skip: i -> i - stride
+                src_list.append(skip_curr)
+                dst_list.append(skip_past)
+                type_list.append(
+                    torch.full(
+                        (len(skip_curr),),
                         EDGE_TYPE_SEMANTIC_BRIDGE,
                         dtype=torch.long,
                         device=device,
@@ -148,6 +134,12 @@ class EdgeBuilder(nn.Module):
         src_all = torch.cat(src_list, dim=0)
         dst_all = torch.cat(dst_list, dim=0)
         edge_types = torch.cat(type_list, dim=0)
+
+        # Enforce strict causal filter: destination must never be in the future of source
+        valid_causal_mask = causal_positions[dst_all] <= causal_positions[src_all]
+        src_all = src_all[valid_causal_mask]
+        dst_all = dst_all[valid_causal_mask]
+        edge_types = edge_types[valid_causal_mask]
 
         edge_index = torch.stack([src_all, dst_all], dim=0)  # [2, E]
 

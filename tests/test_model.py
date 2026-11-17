@@ -61,6 +61,51 @@ class TestModelPipeline(unittest.TestCase):
         self.assertIsNotNone(out["loss"])
         out["loss"].backward()
 
+    def test_tgwt_gradient_causality(self):
+        """
+        Gradient Causality Unit Test:
+        Pass random tensor x of shape (1, 64, d_model) with requires_grad=True,
+        compute loss ONLY at position t = 32, call .backward(),
+        and assert that x.grad[:, 33:, :].abs().max() == 0.0.
+        """
+        torch.manual_seed(42)
+        d_model = 64
+        model = TGWTForCausalLM(
+            vocab_size=1000,
+            max_seq_len=64,
+            d_model=d_model,
+            n_heads=2,
+            n_layers=2,
+            walk_length=16,
+            branch_factor=4,
+        )
+        model.eval()
+
+        x = torch.randn(1, 64, d_model, requires_grad=True)
+        out = model(inputs_embeds=x)
+
+        # Compute loss ONLY at position t = 32
+        loss = out["logits"][:, 32, :].sum()
+        loss.backward()
+
+        self.assertIsNotNone(x.grad)
+        # 1. Assert future tokens [33..63] have strictly 0.0 gradient (zero causal leakage)
+        future_grad = x.grad[:, 33:, :]
+        max_future_grad = future_grad.abs().max().item()
+        self.assertEqual(
+            max_future_grad,
+            0.0,
+            f"Causal leakage detected! Max gradient on future tokens: {max_future_grad}",
+        )
+
+        # 2. Assert past/current tokens [0..32] receive proper gradients
+        past_grad = x.grad[:, :33, :]
+        self.assertGreater(
+            past_grad.abs().max().item(),
+            0.0,
+            "Gradients on past/current tokens must be non-zero.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

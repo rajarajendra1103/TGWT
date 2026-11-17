@@ -25,3 +25,6 @@ Thumbs.db
 
 # Wandb
 wandb/
+
+# Temporary scratch
+scratch/
