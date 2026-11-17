@@ -3,6 +3,7 @@ Evaluation and Benchmarking Script for TGWT vs Baseline Transformer.
 Evaluates the 5 canonical comparison metrics across configurable sequence lengths.
 """
 
+import os
 import argparse
 import torch
 
@@ -41,11 +42,30 @@ def main():
         )
 
         if args.checkpoint:
-            print(f"Loading trained TGWT weights from {args.checkpoint}...")
-            ckpt = torch.load(args.checkpoint, map_location="cpu")
-            state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-            tgwt.load_state_dict(state_dict, strict=False)
-            print("Successfully loaded trained weights!")
+            target_path = args.checkpoint
+            alt_candidates = [
+                target_path,
+                os.path.join("/content", target_path.lstrip("./")),
+                os.path.join("/content/TGWT", target_path.lstrip("./")),
+                os.path.join("/content/drive/MyDrive/TGWT_Backup", target_path.lstrip("./")),
+                os.path.join("/content/drive/MyDrive", target_path.lstrip("./")),
+                "best_model_tgwt.pt",
+            ]
+            found_path = None
+            for p in alt_candidates:
+                if os.path.exists(p):
+                    found_path = p
+                    break
+
+            if found_path:
+                print(f"Loading trained TGWT weights from {found_path}...")
+                ckpt = torch.load(found_path, map_location="cpu")
+                state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+                tgwt.load_state_dict(state_dict, strict=False)
+                print("Successfully loaded trained weights!")
+            else:
+                print(f"[Notice] Checkpoint '{target_path}' not found on disk.")
+                print(f"         Proceeding with benchmark to profile Throughput, VRAM, and FLOPs scaling.")
 
         tgwt = tgwt.to(device)
         baseline = baseline.to(device)
